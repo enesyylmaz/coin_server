@@ -1,5 +1,4 @@
 aiohttp==3.9.5
-Flask==3.0.3
+fastapi==0.111.0
 numpy==1.26.4
 Pillow==10.3.0
-Requests==2.32.2

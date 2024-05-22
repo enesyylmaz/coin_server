@@ -1,14 +1,14 @@
 import os
 import json
 import asyncio
-from aiohttp import ClientSession
+import aiohttp
 from PIL import Image
-import requests
-from io import BytesIO
-from flask import Flask, request, jsonify, send_from_directory
 import numpy as np
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse, FileResponse
+from typing import List
 
-app = Flask(__name__)
+app = FastAPI()
 
 UPLOAD_FOLDER = 'uploads'
 if not os.path.exists(UPLOAD_FOLDER):
@@ -19,7 +19,7 @@ class_names = ['10150', '10151', '10250', '10251', '10270', '10271', '10280', '1
 async def send_to_model(image_np):
     data = json.dumps({"signature_name": "serving_default", "instances": image_np.tolist()})
     headers = {"content-type": "application/json"}
-    async with ClientSession() as session:
+    async with aiohttp.ClientSession() as session:
         async with session.post('https://coin-model-7ynk.onrender.com/v1/models/coin_model:predict', data=data, headers=headers) as response:
             return await response.json()
 
@@ -32,70 +32,71 @@ def get_next_index():
     else:
         return 1
 
-@app.route('/upload', methods=['POST'])
-async def upload_file():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part"}), 400
-    file = request.files['file']
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    if not file:
+        raise HTTPException(status_code=400, detail="No file part")
     if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
-    if file:
-        next_index = get_next_index()
-        filename = f'image_{next_index}_1.jpg'
-        filepath = os.path.join(UPLOAD_FOLDER, filename)
-        file.save(filepath)
+        raise HTTPException(status_code=400, detail="No selected file")
+    
+    next_index = get_next_index()
+    filename = f'image_{next_index}_1.jpg'
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    
+    with open(filepath, "wb") as buffer:
+        buffer.write(await file.read())
+    
+    print(f"Image received: {filename}")
 
-        print(f"Image received: {filename}")
+    img_height, img_width = 256, 256
+    image = Image.open(filepath)
 
-        img_height, img_width = 256, 256
-        image = Image.open(filepath)
+    rotated_image = image.rotate(-90, expand=True)
+    rotated_filename = 'rotated_' + filename
+    rotated_filepath = os.path.join(UPLOAD_FOLDER, rotated_filename)
+    rotated_image.save(rotated_filepath)
 
-        rotated_image = image.rotate(-90, expand=True)
-        rotated_filename = 'rotated_' + filename
-        rotated_filepath = os.path.join(UPLOAD_FOLDER, rotated_filename)
-        rotated_image.save(rotated_filepath)
+    min_dimension = min(rotated_image.width, rotated_image.height)
+    left = (rotated_image.width - min_dimension) / 2
+    top = (rotated_image.height - min_dimension) / 2
+    right = left + min_dimension
+    bottom = top + min_dimension
+    cropped_rotated_image = rotated_image.crop((left, top, right, bottom))
 
-        min_dimension = min(rotated_image.width, rotated_image.height)
-        left = (rotated_image.width - min_dimension) / 2
-        top = (rotated_image.height - min_dimension) / 2
-        right = left + min_dimension
-        bottom = top + min_dimension
-        cropped_rotated_image = rotated_image.crop((left, top, right, bottom))
+    cropped_rotated_filename = 'cropped_rotated_' + filename
+    cropped_rotated_filepath = os.path.join(UPLOAD_FOLDER, cropped_rotated_filename)
+    cropped_rotated_image.save(cropped_rotated_filepath)
 
-        cropped_rotated_filename = 'cropped_rotated_' + filename
-        cropped_rotated_filepath = os.path.join(UPLOAD_FOLDER, cropped_rotated_filename)
-        cropped_rotated_image.save(cropped_rotated_filepath)
+    resized_image = cropped_rotated_image.resize((img_width, img_width))
 
-        resized_image = cropped_rotated_image.resize((img_width, img_width))
-        # image_np = np.array(resized_image)
-        # image_np = image_np.reshape((1, img_width, img_width, 3))
+    reduced_quality_filepath = os.path.join(UPLOAD_FOLDER, f"reduced_quality_{filename}")
+    reduced_quality_image = resized_image.copy()
+    reduced_quality_image.save(reduced_quality_filepath, quality=90)
 
-        
+    image_np = np.array(reduced_quality_image)
+    image_np = image_np.reshape((1, img_width, img_width, 3))
 
-        reduced_quality_filepath = os.path.join(UPLOAD_FOLDER, f"reduced_quality_{filename}")
-        reduced_quality_image = resized_image.copy()
-        reduced_quality_image.save(reduced_quality_filepath, quality=90)
+    np.save(os.path.join(UPLOAD_FOLDER, f"image_np_{next_index}.npy"), image_np)
 
-        image_np = np.array(reduced_quality_image)
-        image_np = image_np.reshape((1, img_width, img_width, 3))
+    predictions = await send_to_model(image_np)
+    predicted_class = class_names[np.argmax(predictions['predictions'][0])]
 
-        np.save(os.path.join(UPLOAD_FOLDER, f"image_np_{next_index}.npy"), image_np)
+    key = predicted_class[:-1]
+    coin_info = requests.get(f"https://coinrecognition.onrender.com/get_info/{key}").json()
+    print(coin_info)
 
-        predictions = await send_to_model(image_np)
-        predicted_class = class_names[np.argmax(predictions['predictions'][0])]
+    return JSONResponse(content={
+        "message": "File uploaded successfully",
+        "filename": cropped_rotated_filename,
+        "reduced_quality_filename": f"reduced_quality_{filename}",
+        "predicted_class": predicted_class,
+        "coin_info": coin_info
+    })
 
-        key = predicted_class[:-1]
-        coin_info = requests.get(f"https://coinrecognition.onrender.com/get_info/{key}").json()
-        print(coin_info)
-
-        return jsonify({
-            "message": "File uploaded successfully",
-            "filename": cropped_rotated_filename,
-            "reduced_quality_filename": f"reduced_quality_{filename}",
-            "predicted_class": predicted_class,
-            "coin_info": coin_info
-        }), 200
-
-@app.route('/uploads/<filename>')
-def uploaded_file(filename):
-    return send_from_directory(UPLOAD_FOLDER, filename)
+@app.get("/uploads/{filename}")
+async def uploaded_file(filename: str):
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    if os.path.exists(filepath):
+        return FileResponse(filepath)
+    else:
+        raise HTTPException(status_code=404, detail="File not found")
